@@ -320,20 +320,27 @@ function appendUsageInfo(area, chat) {
 
 function formatUsage(u, engId) {
     if (!u) return '';
+    const input = u.inputTokens || 0;
+    const output = u.outputTokens || 0;
+    const total = input + output;
+    const cacheRead = u.cacheReadTokens || 0;
+    const cacheWrite = u.cacheWriteTokens || 0;
+
     const parts = [];
-    parts.push('⬆' + (u.inputTokens || 0));
-    parts.push('⬇' + (u.outputTokens || 0));
-    if (u.cacheReadTokens) parts.push('💰命中' + u.cacheReadTokens);
-    if (u.cacheWriteTokens) parts.push('✍缓存写' + u.cacheWriteTokens);
+    parts.push('⬆入' + input);
+    parts.push('⬇出' + output);
+    parts.push('Σ总' + total);                         // ★ token 总数
+    if (cacheRead) parts.push('💰命中' + cacheRead);
+    if (cacheWrite) parts.push('✍写' + cacheWrite);
 
     let costStr = '';
     const p = engId ? S.profiles[engId] : null;
     if (p && (p.priceIn || p.priceOut || p.priceCacheRead || p.priceCacheWrite)) {
         const cost =
-            ((u.inputTokens || 0) - (u.cacheReadTokens || 0) - (u.cacheWriteTokens || 0)) / 1e6 * (p.priceIn || 0)
-            + (u.outputTokens || 0) / 1e6 * (p.priceOut || 0)
-            + (u.cacheReadTokens || 0) / 1e6 * (p.priceCacheRead || 0)
-            + (u.cacheWriteTokens || 0) / 1e6 * (p.priceCacheWrite || 0);
+            (Math.max(0, input - cacheRead - cacheWrite)) / 1e6 * (p.priceIn || 0)
+            + output / 1e6 * (p.priceOut || 0)
+            + cacheRead / 1e6 * (p.priceCacheRead || 0)
+            + cacheWrite / 1e6 * (p.priceCacheWrite || 0);
         if (cost > 0) costStr = ' ≈¥' + cost.toFixed(4);
     }
     return ' | ' + parts.join(' ') + costStr;
