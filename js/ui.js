@@ -270,9 +270,10 @@ const UI = (function () {
 
         if (msg.role === 'assistant' && msg.content) {
             const wc = cntW(msg.content);
+            const cc = (typeof cntChars === 'function') ? cntChars(msg.content) : 0;
             if (wc > 0) {
                 const w = document.createElement('span');
-                w.textContent = wc + ' 字';
+                w.textContent = wc + ' 字 / ' + cc + ' 字符';
                 mm.appendChild(w);
             }
         }
