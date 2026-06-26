@@ -17,11 +17,20 @@ function esc(t) {
     return d.innerHTML;
 }
 
-// 字数统计（中英文）
+// 字数统计（中文字 + 英文单词 + 数字串，更贴近直觉）
 function cntW(t) {
     if (!t) return 0;
-    return (String(t).match(/[\u4e00-\u9fff]/g) || []).length
-         + (String(t).match(/[a-zA-Z]+/g) || []).length;
+    const s = String(t);
+    const cn = (s.match(/[\u4e00-\u9fff]/g) || []).length;     // 中文字
+    const en = (s.match(/[a-zA-Z]+/g) || []).length;            // 英文单词
+    const num = (s.match(/\d+(?:\.\d+)?/g) || []).length;       // 数字串
+    return cn + en + num;
+}
+
+// 字符总数（不计空格/换行），最接近 Word「字符数(不计空格)」
+function cntChars(t) {
+    if (!t) return 0;
+    return String(t).replace(/\s/g, '').length;
 }
 
 // 当前时间 HH:MM
