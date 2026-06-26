@@ -1014,10 +1014,16 @@ async function handleUploadedFiles(files) {
         else { failCount++; toast('❌ ' + r.file.name + '：' + r.error, 'er'); }
     });
 
-    if (_attContinuous && okCount > 0) {
-        const c = curChat();
+    // 实时读取勾选框状态，不依赖可能过期的 _attContinuous
+    const contChk = document.getElementById('attCont');
+    const isContinuous = contChk ? contChk.checked : _attContinuous;
+
+    if (isContinuous && okCount > 0) {
+        let c = curChat();
+        if (!c) { newChat(); c = curChat(); }   // 没会话先建一个，避免静默丢失
         if (c) {
             if (!c.knowledgeBase) c.knowledgeBase = [];
+            let addedToKB = 0;
             results.forEach(r => {
                 if (r.ok) {
                     c.knowledgeBase.push({
@@ -1025,18 +1031,22 @@ async function handleUploadedFiles(files) {
                         text: r.result.text || '', dataUrl: r.result.dataUrl || null,
                         meta: r.result.meta || {}, addedAt: Date.now(),
                     });
+                    addedToKB++;
                 }
             });
             c.updatedAt = Date.now();
             await saveNow();
             renderKBList();
+            if (addedToKB > 0) {
+                toast('📚 已加入持续参考（' + addedToKB + ' 个文件），后续每轮都会自动参考');
+            }
         }
+    } else {
+        if (okCount > 0) toast('✅ 已解析 ' + okCount + ' 个文件' + (failCount ? '（' + failCount + ' 失败）' : ''));
     }
 
-    if (okCount > 0) toast('✅ 已解析 ' + okCount + ' 个文件' + (failCount ? '（' + failCount + ' 失败）' : ''));
     renderAttList();
 }
-
 function renderAttList() {
     const box = document.getElementById('attListBox');
     const list = document.getElementById('attList');
