@@ -1,0 +1,1491 @@
+/* ===== 飞凡AI - 主入口 (v2.3.8) ===== */
+/* v2.3.8: 多协议(OpenAI/Anthropic/Gemini) + 缓存 + token/费用显示 + 多Key */
+
+let S = {
+    profiles: {},
+    chats: {},
+    chatOrder: [],
+    currentChatId: null,
+    currentEngId: 'zenmux',
+    theme: 'light',
+    snapInterval: 5,
+    userName: '',
+    archiveInterval: 10,
+};
+
+let _saveTimer = null;
+let _saveInProgress = null;
+let _streamCtrl = null;
+let _pendingAtts = [];
+let _attContinuous = false;
+let _exportMode = 'full';
+
+/* ===== 持久化 ===== */
+function scheduleSave() {
+    if (_saveTimer) clearTimeout(_saveTimer);
+    _saveTimer = setTimeout(saveNow, 300);
+}
+async function saveNow() {
+    if (_saveInProgress) { await _saveInProgress; return; }
+    _saveInProgress = DB.saveState(S);
+    try { await _saveInProgress; }
+    finally { _saveInProgress = null; }
+}
+async function loadState() {
+    const loaded = await DB.loadState();
+    if (loaded && typeof loaded === 'object') {
+        S = Object.assign({
+            profiles: {}, chats: {}, chatOrder: [],
+            currentChatId: null, currentEngId: 'zenmux',
+            theme: 'light', snapInterval: 5, userName: '', archiveInterval: 10,
+        }, loaded);
+
+        if (!S.chatOrder || !S.chatOrder.length) {
+            S.chatOrder = Object.keys(S.chats || {}).sort((a, b) =>
+                (S.chats[b].updatedAt || 0) - (S.chats[a].updatedAt || 0));
+        }
+        for (const cid in S.chats) {
+            const c = S.chats[cid];
+            if (c.messages) {
+                c.messages.forEach(m => {
+                    if (m._streaming) { m._streaming = false; m._interrupted = true; }
+                });
+            }
+        }
+    }
+    if (!S.profiles || !Object.keys(S.profiles).length) {
+        S.profiles = JSON.parse(JSON.stringify(API.DEFAULT_PROFILES));
+    }
+    for (const id in S.profiles) {
+        const p = S.profiles[id];
+        if (p.useTemp === undefined) p.useTemp = true;
+        if (p.useMax === undefined) p.useMax = true;
+        if (p.useTopP === undefined) p.useTopP = false;
+        if (p.useFreq === undefined) p.useFreq = false;
+        if (p.temperature === undefined) p.temperature = 0.7;
+        if (p.max_tokens === undefined) p.max_tokens = 4096;
+        if (p.top_p === undefined) p.top_p = 1;
+        if (p.frequency_penalty === undefined) p.frequency_penalty = 0;
+        if (p.protocol === undefined) p.protocol = 'openai';
+        if (p.authType === undefined) p.authType = (p.protocol === 'anthropic' || p.protocol === 'gemini') ? 'auto' : 'bearer';
+        if (p.useCache === undefined) p.useCache = false;
+        if (p.cacheTTL === undefined) p.cacheTTL = '5m';
+        if (p.priceIn === undefined) p.priceIn = 0;
+        if (p.priceOut === undefined) p.priceOut = 0;
+        if (p.priceCacheRead === undefined) p.priceCacheRead = 0;
+        if (p.priceCacheWrite === undefined) p.priceCacheWrite = 0;
+    }
+    if (!S.profiles[S.currentEngId]) {
+        S.currentEngId = Object.keys(S.profiles)[0] || 'zenmux';
+    }
+    if (S.theme === 'dark') {
+        document.documentElement.setAttribute('data-theme', 'dark');
+        const tb = document.getElementById('themeBtn');
+        if (tb) tb.textContent = '☀️';
+    }
+}
+
+/* ===== 当前会话/引擎 ===== */
+function curChat() {
+    if (!S.currentChatId) return null;
+    return S.chats[S.currentChatId] || null;
+}
+function curProfile() {
+    const eid = S.currentEngId;
+    return S.profiles[eid] || S.profiles[Object.keys(S.profiles)[0]];
+}
+
+/* ===== 会话管理 ===== */
+function newChat() {
+    const id = gId();
+    S.chats[id] = {
+        id: id, title: '新对话', messages: [], systemPrompt: '',
+        knowledgeBase: [], isPinned: false, isArchived: false,
+        createdAt: Date.now(), updatedAt: Date.now(),
+    };
+    S.chatOrder.unshift(id);
+    S.currentChatId = id;
+    scheduleSave();
+    renderAll();
+    if (IS_MOBILE) {
+        document.getElementById('sb').classList.remove('open');
+        document.getElementById('sbOv').classList.remove('show');
+    }
+}
+function switchChat(id) {
+    if (!S.chats[id]) return;
+    S.currentChatId = id;
+    scheduleSave();
+    renderAll();
+    if (IS_MOBILE) {
+        document.getElementById('sb').classList.remove('open');
+        document.getElementById('sbOv').classList.remove('show');
+    }
+}
+function delChat(id) {
+    if (!confirm('确认删除此对话？')) return;
+    delete S.chats[id];
+    S.chatOrder = S.chatOrder.filter(x => x !== id);
+    if (S.currentChatId === id) S.currentChatId = S.chatOrder[0] || null;
+    scheduleSave();
+    renderAll();
+}
+function renameChat(id) {
+    const c = S.chats[id];
+    if (!c) return;
+    const nv = prompt('重命名对话：', c.title);
+    if (nv && nv.trim()) {
+        c.title = nv.trim();
+        c.updatedAt = Date.now();
+        scheduleSave();
+        renderAll();
+    }
+}
+function updTitle(v) {
+    const c = curChat();
+    if (!c) return;
+    c.title = (v || '').trim() || '新对话';
+    c.updatedAt = Date.now();
+    scheduleSave();
+    renderSB();
+}
+function pinC() {
+    const c = curChat();
+    if (!c) return;
+    c.isPinned = !c.isPinned;
+    c.updatedAt = Date.now();
+    scheduleSave();
+    renderAll();
+    toast(c.isPinned ? '已置顶' : '已取消置顶');
+}
+function arcC() {
+    const c = curChat();
+    if (!c) return;
+    c.isArchived = !c.isArchived;
+    c.updatedAt = Date.now();
+    scheduleSave();
+    renderAll();
+    toast(c.isArchived ? '已归档' : '已取消归档');
+}
+function clrC() {
+    const c = curChat();
+    if (!c) return;
+    if (!confirm('清空当前对话所有消息？')) return;
+    c.messages = [];
+    c.updatedAt = Date.now();
+    scheduleSave();
+    renderMs();
+}
+
+/* ===== 分享对话 ===== */
+async function shareC() {
+    const c = curChat();
+    if (!c) { toast('请先选择一个对话', 'er'); return; }
+    if (!c.messages || !c.messages.length) { toast('对话为空，无法分享', 'er'); return; }
+
+    const includeKB = (c.knowledgeBase && c.knowledgeBase.length > 0)
+        ? confirm('是否包含知识库文件？\n\n✅ 确定 = 包含\n❌ 取消 = 不包含（文件更小）')
+        : false;
+
+    let password = '';
+    if (Snapshot.SUPPORTS_CRYPTO) {
+        const wantPwd = confirm(
+            '是否设置访问口令？\n\n' +
+            '✅ 确定 = 设置口令（对方需输入口令才能打开，最安全）\n' +
+            '❌ 取消 = 不设口令（仅飞凡AI用户可打开，外人是乱码）'
+        );
+        if (wantPwd) {
+            const pwd = prompt('请输入访问口令（请记住并告知接收方）：', '');
+            if (pwd && pwd.trim()) password = pwd.trim();
+            else toast('未输入口令，将仅用应用密钥加密');
+        }
+    }
+
+    await Snapshot.shareChat(c, {
+        includeKB: includeKB,
+        sharedBy: S.userName || '',
+        encrypt: true,
+        password: password,
+    });
+}
+
+/* ===== 主题 / 用户名 ===== */
+function togTheme() {
+    S.theme = S.theme === 'dark' ? 'light' : 'dark';
+    document.documentElement.setAttribute('data-theme', S.theme === 'dark' ? 'dark' : '');
+    document.getElementById('themeBtn').textContent = S.theme === 'dark' ? '☀️' : '🌙';
+    scheduleSave();
+}
+function updUserName(v) {
+    S.userName = (v || '').trim();
+    scheduleSave();
+}
+
+/* ===== 渲染：侧边栏 ===== */
+function renderSB() {
+    const search = (document.getElementById('schIn').value || '').toLowerCase();
+    const pinList = document.getElementById('pinList');
+    const chatList = document.getElementById('chatList');
+    const arcList = document.getElementById('arcList');
+    pinList.innerHTML = ''; chatList.innerHTML = ''; arcList.innerHTML = '';
+
+    const order = S.chatOrder.filter(id => S.chats[id]);
+    let pinCount = 0, arcCount = 0;
+
+    order.forEach(id => {
+        const c = S.chats[id];
+        if (search) {
+            const hay = (c.title + ' ' + (c.messages || []).map(m =>
+                typeof m.content === 'string' ? m.content : '').join(' ')).toLowerCase();
+            if (!hay.includes(search)) return;
+        }
+
+        const li = document.createElement('li');
+        li.className = 'ci' + (id === S.currentChatId ? ' act' : '');
+        li.onclick = () => switchChat(id);
+
+        const span = document.createElement('span');
+        span.className = 'ct';
+        span.textContent = c.title || '新对话';
+        li.appendChild(span);
+
+        const acts = document.createElement('div');
+        acts.className = 'ia';
+        const renBtn = document.createElement('button');
+        renBtn.textContent = '✏️'; renBtn.title = '重命名';
+        renBtn.onclick = (e) => { e.stopPropagation(); renameChat(id); };
+        const delBtn = document.createElement('button');
+        delBtn.textContent = '🗑️'; delBtn.title = '删除';
+        delBtn.onclick = (e) => { e.stopPropagation(); delChat(id); };
+        acts.appendChild(renBtn);
+        acts.appendChild(delBtn);
+        li.appendChild(acts);
+
+        if (c.isArchived) { arcList.appendChild(li); arcCount++; }
+        else if (c.isPinned) { pinList.appendChild(li); pinCount++; }
+        else chatList.appendChild(li);
+    });
+
+    document.getElementById('pinLbl').style.display = pinCount ? 'block' : 'none';
+    document.getElementById('arcLbl').style.display = arcCount ? 'block' : 'none';
+
+    const p = curProfile();
+    const protoTag = p ? (p.protocol === 'anthropic' ? ' [Claude原生]'
+                        : p.protocol === 'gemini' ? ' [Gemini原生]' : '') : '';
+    const cacheTag = (p && p.useCache) ? ' 💰缓存' : '';
+    document.getElementById('badge').innerHTML = p
+        ? '当前引擎: <strong>' + esc(p.name) + '</strong>' + esc(protoTag) + esc(cacheTag)
+          + '<br>模型: ' + esc(p.model || '-')
+        : '请先在 ⚙️ 中配置引擎';
+}
+
+/* ===== 渲染：消息区 ===== */
+function renderMs() {
+    const area = document.getElementById('msgsArea');
+    const c = curChat();
+    if (!c) {
+        area.innerHTML = '<div class="empty"><div class="ico">🚀</div><p>请先新建一个对话</p></div>';
+        return;
+    }
+    UI.renderMessages(area, c.messages, {
+        onDelete: (m) => {
+            c.messages = c.messages.filter(x => x !== m);
+            c.updatedAt = Date.now();
+            scheduleSave();
+            renderMs();
+        },
+        onRegen: (m) => regenerate(m),
+    });
+    appendUsageInfo(area, c);
+    document.getElementById('titleIn').value = c.title || '';
+    document.getElementById('pinBtn').textContent = c.isPinned ? '📍' : '📌';
+}
+
+function appendUsageInfo(area, chat) {
+    const nodes = area.querySelectorAll('.msg.assistant');
+    let idx = 0;
+    const aiMsgs = (chat.messages || []).filter(m => m.role === 'assistant');
+    nodes.forEach(node => {
+        const m = aiMsgs[idx++];
+        if (!m || !m._usage) return;
+        const mm = node.querySelector('.mm');
+        if (!mm || mm.querySelector('.usage-tag')) return;
+        const tag = document.createElement('span');
+        tag.className = 'usage-tag';
+        tag.style.cssText = 'font-size:10px;color:var(--text2);opacity:.85';
+        tag.innerHTML = formatUsage(m._usage, m._engId);
+        mm.appendChild(tag);
+    });
+}
+
+function formatUsage(u, engId) {
+    if (!u) return '';
+    const parts = [];
+    parts.push('⬆' + (u.inputTokens || 0));
+    parts.push('⬇' + (u.outputTokens || 0));
+    if (u.cacheReadTokens) parts.push('💰命中' + u.cacheReadTokens);
+    if (u.cacheWriteTokens) parts.push('✍缓存写' + u.cacheWriteTokens);
+
+    let costStr = '';
+    const p = engId ? S.profiles[engId] : null;
+    if (p && (p.priceIn || p.priceOut || p.priceCacheRead || p.priceCacheWrite)) {
+        const cost =
+            ((u.inputTokens || 0) - (u.cacheReadTokens || 0) - (u.cacheWriteTokens || 0)) / 1e6 * (p.priceIn || 0)
+            + (u.outputTokens || 0) / 1e6 * (p.priceOut || 0)
+            + (u.cacheReadTokens || 0) / 1e6 * (p.priceCacheRead || 0)
+            + (u.cacheWriteTokens || 0) / 1e6 * (p.priceCacheWrite || 0);
+        if (cost > 0) costStr = ' ≈¥' + cost.toFixed(4);
+    }
+    return ' | ' + parts.join(' ') + costStr;
+}
+
+function renderAll() {
+    renderSB();
+    renderMs();
+    renderEngTabs();
+    renderEngForm();
+    renderCSForm();
+    renderStorageInfo();
+    renderArchiveInfo();
+}
+
+/* ===== ⚙️ 引擎配置 ===== */
+function renderEngTabs() {
+    const tabs = document.getElementById('engTabs');
+    if (!tabs) return;
+    tabs.innerHTML = '';
+    Object.values(S.profiles).forEach(p => {
+        const b = document.createElement('button');
+        b.className = 'tab' + (p.id === S.currentEngId ? ' act' : '');
+        b.textContent = p.name;
+        b.onclick = () => {
+            S.currentEngId = p.id;
+            renderEngTabs();
+            renderEngForm();
+            renderSB();
+            renderMs();
+            scheduleSave();
+            toast('已切换到：' + p.name);
+        };
+        tabs.appendChild(b);
+    });
+}
+
+const MAX_TOKEN_PRESETS = [
+    { label: '4K', val: 4096 }, { label: '8K', val: 8192 },
+    { label: '16K', val: 16384 }, { label: '32K', val: 32768 },
+    { label: '64K', val: 65536 }, { label: '128K', val: 131072 },
+    { label: '256K', val: 262144 }, { label: '1M', val: 1048576 },
+];
+
+function renderEngForm() {
+    const form = document.getElementById('engForm');
+    if (!form) return;
+    const p = S.profiles[S.currentEngId];
+    if (!p) {
+        form.innerHTML = '<p style="color:var(--text2)">请选择一个引擎</p>';
+        return;
+    }
+
+    form.innerHTML = `
+        <div class="fg">
+            <label>引擎名称</label>
+            <input type="text" id="engName" value="${esc(p.name)}">
+        </div>
+
+        <div class="fr">
+            <div class="fg">
+                <label>📡 协议类型</label>
+                <select id="engProto">
+                    <option value="openai"${p.protocol === 'openai' ? ' selected' : ''}>OpenAI 兼容</option>
+                    <option value="anthropic"${p.protocol === 'anthropic' ? ' selected' : ''}>Anthropic 原生 (Claude)</option>
+                    <option value="gemini"${p.protocol === 'gemini' ? ' selected' : ''}>Gemini 原生 (Google)</option>
+                </select>
+            </div>
+            <div class="fg">
+                <label>🔐 认证方式</label>
+                <select id="engAuth">
+                    <option value="auto"${p.authType === 'auto' ? ' selected' : ''}>自动（不确定选这个）</option>
+                    <option value="bearer"${p.authType === 'bearer' ? ' selected' : ''}>Authorization: Bearer</option>
+                    <option value="x-api-key"${p.authType === 'x-api-key' ? ' selected' : ''}>x-api-key</option>
+                    <option value="url-key"${p.authType === 'url-key' ? ' selected' : ''}>URL ?key=</option>
+                </select>
+            </div>
+        </div>
+
+        <div class="fg">
+            <label>🌐 Base URL</label>
+            <input type="text" id="engBase" value="${esc(p.base)}" placeholder="https://api.openai-proxy.org/v1">
+            <div style="font-size:11px;color:var(--text2);margin-top:4px">
+                OpenAI兼容→ 填带 /v1 的地址；Claude→ 填 .../anthropic；Gemini→ 填 .../google
+            </div>
+        </div>
+
+        <div class="fg">
+            <label>🔑 API Key
+                <span style="font-weight:normal;color:var(--text2);font-size:11px">（可填多个，每行一个或逗号分隔，自动轮询）</span>
+            </label>
+            <textarea id="engKey" rows="2" autocomplete="off" placeholder="sk-...&#10;sk-备用key...">${esc(p.key)}</textarea>
+        </div>
+
+        <div class="fg">
+            <label>🧠 模型 ID</label>
+            <div style="display:flex;gap:6px">
+                <input type="text" id="engModel" value="${esc(p.model)}" placeholder="claude-opus-4-8" style="flex:1">
+                <button class="btn btn-s" onclick="fMdls()" id="fMdlsBtn" style="white-space:nowrap">🔄 获取</button>
+            </div>
+            <div id="mdlSel" style="display:none;margin-top:6px"></div>
+        </div>
+
+        <div style="margin-top:14px;padding:12px;background:var(--pri-l);border-radius:10px">
+            <div class="pt">
+                <input type="checkbox" id="engUseCache" ${p.useCache ? 'checked' : ''}>
+                <label for="engUseCache">💰 开启 Prompt 缓存（省 token）</label>
+            </div>
+            <div id="engCacheBox" style="${p.useCache ? '' : 'display:none'};padding-left:23px;margin-top:6px">
+                <label style="font-size:12px;color:var(--text2)">缓存时长（仅 Anthropic 原生支持选 1h）</label>
+                <select id="engCacheTTL" style="margin-top:4px">
+                    <option value="5m"${p.cacheTTL === '5m' ? ' selected' : ''}>5 分钟（默认，命中自动续期）</option>
+                    <option value="1h"${p.cacheTTL === '1h' ? ' selected' : ''}>1 小时（适合长时间慢聊）</option>
+                </select>
+                <div style="font-size:11px;color:var(--text2);margin-top:6px;line-height:1.6">
+                    给 System Prompt + 历史对话打缓存标记。缓存仅影响计费，不影响发送内容（每轮始终发全量对话）。
+                </div>
+            </div>
+        </div>
+
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+            <h4 style="font-size:13px;margin-bottom:10px">⚙️ 运行时参数</h4>
+            <div class="pt">
+                <input type="checkbox" id="engUseTemp" ${p.useTemp ? 'checked' : ''}>
+                <label for="engUseTemp">🔥 Temperature 温度</label>
+            </div>
+            <div class="ps" id="engTempBox" style="${p.useTemp ? '' : 'display:none'}">
+                <input type="range" id="engTemp" min="0" max="2" step="0.1" value="${p.temperature}">
+                <div>当前值：<span class="pv" id="engTempV">${p.temperature}</span>
+                    <span style="font-size:11px;color:var(--text2);margin-left:8px">0=精确, 2=发散</span>
+                </div>
+            </div>
+            <div class="pt">
+                <input type="checkbox" id="engUseMax" ${p.useMax ? 'checked' : ''}>
+                <label for="engUseMax">📏 Max Tokens 最大输出长度</label>
+            </div>
+            <div class="ps" id="engMaxBox" style="${p.useMax ? '' : 'display:none'}">
+                <input type="number" id="engMax" value="${p.max_tokens}" min="1" max="2097152">
+                <div class="presets">
+                    ${MAX_TOKEN_PRESETS.map(x => `<button onclick="setMax(${x.val})">${x.label}</button>`).join('')}
+                </div>
+            </div>
+            <div class="pt">
+                <input type="checkbox" id="engUseTopP" ${p.useTopP ? 'checked' : ''}>
+                <label for="engUseTopP">🎲 Top P 核采样</label>
+            </div>
+            <div class="ps" id="engTopPBox" style="${p.useTopP ? '' : 'display:none'}">
+                <input type="range" id="engTopP" min="0" max="1" step="0.05" value="${p.top_p}">
+                <div>当前值：<span class="pv" id="engTopPV">${p.top_p}</span></div>
+            </div>
+            <div class="pt">
+                <input type="checkbox" id="engUseFreq" ${p.useFreq ? 'checked' : ''}>
+                <label for="engUseFreq">🚫 Frequency Penalty 重复惩罚（Gemini不支持）</label>
+            </div>
+            <div class="ps" id="engFreqBox" style="${p.useFreq ? '' : 'display:none'}">
+                <input type="range" id="engFreq" min="-2" max="2" step="0.1" value="${p.frequency_penalty}">
+                <div>当前值：<span class="pv" id="engFreqV">${p.frequency_penalty}</span></div>
+            </div>
+        </div>
+
+        <div style="margin-top:16px;padding-top:14px;border-top:1px solid var(--border)">
+            <h4 style="font-size:13px;margin-bottom:8px">💵 费用估算单价（元 / 1M token，选填）</h4>
+            <div class="fr">
+                <div class="fg"><label>输入</label><input type="number" id="engPriceIn" value="${p.priceIn || 0}" step="0.01" min="0"></div>
+                <div class="fg"><label>输出</label><input type="number" id="engPriceOut" value="${p.priceOut || 0}" step="0.01" min="0"></div>
+            </div>
+            <div class="fr">
+                <div class="fg"><label>缓存命中(读)</label><input type="number" id="engPriceCR" value="${p.priceCacheRead || 0}" step="0.01" min="0"></div>
+                <div class="fg"><label>缓存写入</label><input type="number" id="engPriceCW" value="${p.priceCacheWrite || 0}" step="0.01" min="0"></div>
+            </div>
+            <div style="font-size:11px;color:var(--text2)">
+                填了单价后，每条回复下方会显示估算费用。不填则只显示 token 数。
+            </div>
+        </div>
+
+        <div style="display:flex;gap:8px;margin-top:18px;flex-wrap:wrap">
+            <button class="btn btn-p" onclick="saveEng()">💾 保存配置</button>
+            <button class="btn" onclick="tConn()" id="tConnBtn">🔑 测试连通</button>
+            ${API.DEFAULT_PROFILES[p.id] ? '' : '<button class="btn btn-d" onclick="delEng()">🗑️ 删除</button>'}
+        </div>
+    `;
+    bindEngEvents(p);
+}
+
+function bindEngEvents(p) {
+    const bind = (id, ev, fn) => { const el = document.getElementById(id); if (el) el[ev] = fn; };
+    bind('engUseTemp', 'onchange', e => document.getElementById('engTempBox').style.display = e.target.checked ? '' : 'none');
+    bind('engUseMax', 'onchange', e => document.getElementById('engMaxBox').style.display = e.target.checked ? '' : 'none');
+    bind('engUseTopP', 'onchange', e => document.getElementById('engTopPBox').style.display = e.target.checked ? '' : 'none');
+    bind('engUseFreq', 'onchange', e => document.getElementById('engFreqBox').style.display = e.target.checked ? '' : 'none');
+    bind('engUseCache', 'onchange', e => document.getElementById('engCacheBox').style.display = e.target.checked ? '' : 'none');
+    bind('engTemp', 'oninput', e => document.getElementById('engTempV').textContent = e.target.value);
+    bind('engTopP', 'oninput', e => document.getElementById('engTopPV').textContent = e.target.value);
+    bind('engFreq', 'oninput', e => document.getElementById('engFreqV').textContent = e.target.value);
+    bind('engProto', 'onchange', e => {
+        const auth = document.getElementById('engAuth');
+        if (auth && (e.target.value === 'anthropic' || e.target.value === 'gemini')) auth.value = 'auto';
+        else if (auth) auth.value = 'bearer';
+    });
+}
+
+function setMax(val) { document.getElementById('engMax').value = val; }
+
+function saveEng() {
+    const p = S.profiles[S.currentEngId];
+    if (!p) return;
+    p.name = document.getElementById('engName').value.trim() || p.name;
+    p.protocol = document.getElementById('engProto').value;
+    p.authType = document.getElementById('engAuth').value;
+    p.base = document.getElementById('engBase').value.trim();
+    p.key = document.getElementById('engKey').value.trim();
+    p.model = document.getElementById('engModel').value.trim();
+    p.useTemp = document.getElementById('engUseTemp').checked;
+    p.temperature = parseFloat(document.getElementById('engTemp').value);
+    p.useMax = document.getElementById('engUseMax').checked;
+    p.max_tokens = parseInt(document.getElementById('engMax').value, 10);
+    p.useTopP = document.getElementById('engUseTopP').checked;
+    p.top_p = parseFloat(document.getElementById('engTopP').value);
+    p.useFreq = document.getElementById('engUseFreq').checked;
+    p.frequency_penalty = parseFloat(document.getElementById('engFreq').value);
+    p.useCache = document.getElementById('engUseCache').checked;
+    p.cacheTTL = document.getElementById('engCacheTTL').value;
+    p.priceIn = parseFloat(document.getElementById('engPriceIn').value) || 0;
+    p.priceOut = parseFloat(document.getElementById('engPriceOut').value) || 0;
+    p.priceCacheRead = parseFloat(document.getElementById('engPriceCR').value) || 0;
+    p.priceCacheWrite = parseFloat(document.getElementById('engPriceCW').value) || 0;
+    scheduleSave();
+    renderEngTabs();
+    renderSB();
+    renderMs();
+    toast('✅ 配置已保存');
+}
+
+async function fMdls() {
+    const p = S.profiles[S.currentEngId];
+    if (!p) return;
+    p.protocol = document.getElementById('engProto').value;
+    p.authType = document.getElementById('engAuth').value;
+    p.base = document.getElementById('engBase').value.trim();
+    p.key = document.getElementById('engKey').value.trim();
+    if (!p.base || !p.key) { toast('请先填写 Base URL 和 API Key', 'er'); return; }
+    const btn = document.getElementById('fMdlsBtn');
+    btn.disabled = true; btn.textContent = '⏳ 获取中...';
+    try {
+        const list = await API.fetchModels(p);
+        if (!list.length) { toast('未返回任何模型', 'er'); return; }
+        const sel = document.getElementById('mdlSel');
+        sel.style.display = '';
+        sel.innerHTML = '<select id="mdlPick" style="width:100%;padding:7px;border:1px solid var(--border);border-radius:6px;background:var(--bg);color:var(--text)">'
+            + list.map(m => '<option value="' + esc(m) + '"' + (m === p.model ? ' selected' : '') + '>' + esc(m) + '</option>').join('')
+            + '</select>';
+        document.getElementById('mdlPick').onchange = (e) => {
+            document.getElementById('engModel').value = e.target.value;
+        };
+        toast('✅ 已获取 ' + list.length + ' 个模型');
+    } catch (e) {
+        toast('获取失败：' + e.message, 'er');
+    } finally {
+        btn.disabled = false; btn.textContent = '🔄 获取';
+    }
+}
+
+async function tConn() {
+    const p = S.profiles[S.currentEngId];
+    if (!p) return;
+    p.protocol = document.getElementById('engProto').value;
+    p.authType = document.getElementById('engAuth').value;
+    p.base = document.getElementById('engBase').value.trim();
+    p.key = document.getElementById('engKey').value.trim();
+    if (!p.base || !p.key) { toast('请先填写 Base URL 和 API Key', 'er'); return; }
+    const btn = document.getElementById('tConnBtn');
+    btn.disabled = true; btn.textContent = '⏳ 测试中...';
+    const result = await API.testConnection(p);
+    btn.disabled = false; btn.textContent = '🔑 测试连通';
+    toast(result.msg, result.ok ? 'ok' : 'er');
+}
+
+function addEng() {
+    const name = prompt('新引擎名称：', '我的引擎');
+    if (!name || !name.trim()) return;
+    const id = 'custom_' + gId().slice(0, 8);
+    S.profiles[id] = {
+        id: id, name: name.trim(),
+        protocol: 'openai', authType: 'bearer',
+        base: 'https://api.openai-proxy.org/v1', key: '', model: 'gpt-4o-mini',
+        useTemp: true, temperature: 0.7, useMax: true, max_tokens: 4096,
+        useTopP: false, top_p: 1, useFreq: false, frequency_penalty: 0,
+        useCache: false, cacheTTL: '5m',
+        priceIn: 0, priceOut: 0, priceCacheRead: 0, priceCacheWrite: 0,
+    };
+    S.currentEngId = id;
+    scheduleSave();
+    renderEngTabs();
+    renderEngForm();
+    renderSB();
+    renderMs();
+}
+
+function delEng() {
+    const p = S.profiles[S.currentEngId];
+    if (!p) return;
+    if (API.DEFAULT_PROFILES[p.id]) { toast('内置引擎不可删除', 'er'); return; }
+    if (!confirm('删除引擎 ' + p.name + '？')) return;
+    delete S.profiles[p.id];
+    S.currentEngId = Object.keys(S.profiles)[0] || 'zenmux';
+    scheduleSave();
+    renderEngTabs();
+    renderEngForm();
+    renderSB();
+    renderMs();
+    toast('已删除');
+}
+
+/* ===== 全局设置 ===== */
+function renderGlobalSettings() {
+    const uIn = document.getElementById('userNameIn');
+    if (uIn) uIn.value = S.userName || '';
+    const ai = document.getElementById('archiveIntervalSel');
+    if (ai) ai.value = String(S.archiveInterval !== undefined ? S.archiveInterval : 10);
+    renderArchiveInfo();
+}
+
+function renderArchiveInfo() {
+    const el = document.getElementById('archiveInfo');
+    if (!el || typeof Archive === 'undefined') return;
+    if (!Archive.isSupported()) {
+        el.innerHTML = '<span style="color:var(--text2)">⚠️ 当前浏览器不支持自动存档（需 Chrome / Edge）</span>';
+        return;
+    }
+    if (Archive.isEnabled()) {
+        const authTxt = Archive.isAuthorized() ? '🟢 已授权' : '🔴 待授权（请刷新后点击授权弹窗）';
+        el.innerHTML = '✅ 已开启自动存档（' + authTxt + '）<br>目录：<strong>' + esc(Archive.getDirName()) + '</strong>'
+            + '<br><span style="font-size:11px;color:var(--text2)">每 ' + (S.archiveInterval || 10)
+            + ' 分钟 + AI回复停笔1分钟后，自动保存有变动的对话（HTML + JSON）</span>';
+    } else {
+        el.innerHTML = '<span style="color:var(--text2)">未设置存档目录（设置后将自动备份对话到局域网共享目录）</span>';
+    }
+}
+
+function updArchiveInterval(v) {
+    S.archiveInterval = parseInt(v, 10) || 0;
+    scheduleSave();
+    if (typeof Archive !== 'undefined') Archive.setInterval(S.archiveInterval);
+    renderArchiveInfo();
+    toast('存档间隔：' + (S.archiveInterval ? S.archiveInterval + ' 分钟' : '关闭定时（仅回复后存）'));
+}
+
+async function chooseArchiveDir() {
+    if (typeof Archive === 'undefined') return;
+    const ok = await Archive.chooseDir();
+    if (ok) {
+        Archive.setInterval(S.archiveInterval || 10);
+        renderArchiveInfo();
+        await Archive.archiveAll({ silent: false });
+    }
+}
+
+async function clearArchiveDir() {
+    if (typeof Archive === 'undefined') return;
+    if (!confirm('确认关闭自动存档？（已存档的文件不会被删除）')) return;
+    await Archive.clearDir();
+    renderArchiveInfo();
+}
+
+async function archiveNowBtn() {
+    if (typeof Archive === 'undefined') return;
+    await Archive.archiveNow();
+}
+
+/* ===== 会话设置 ===== */
+function renderCSForm() {
+    const c = curChat();
+    if (!c) return;
+    const sp = document.getElementById('spIn');
+    if (sp) sp.value = c.systemPrompt || '';
+    const si = document.getElementById('snapInterval');
+    if (si) si.value = String(S.snapInterval || 5);
+}
+function updSP(v) {
+    const c = curChat();
+    if (!c) return;
+    c.systemPrompt = v || '';
+    c.updatedAt = Date.now();
+    scheduleSave();
+}
+function updSnapInterval(v) {
+    S.snapInterval = parseInt(v, 10) || 0;
+    scheduleSave();
+    if (typeof Snapshot !== 'undefined') Snapshot.startAuto(S.snapInterval, () => S);
+    toast('快照间隔：' + (S.snapInterval ? S.snapInterval + ' 分钟' : '关闭'));
+}
+
+/* ===== 存储信息 ===== */
+async function renderStorageInfo() {
+    const el = document.getElementById('storageInfo');
+    if (!el) return;
+    try {
+        const info = await DB.getStorageInfo();
+        el.innerHTML =
+            '已用：<strong>' + info.usedText + '</strong><br>' +
+            '配额：' + info.quotaText + '（' + info.percent + '%）<br>' +
+            '持久化：' + (info.persisted ? '✅ 已启用' : '⚠️ 未启用（可能被清理）') + '<br>' +
+            '版本：' + APP_VERSION;
+    } catch (e) {
+        el.textContent = '存储信息获取失败';
+    }
+}
+
+/* ===== 发送消息 ===== */
+async function send() {
+    if (_streamCtrl) { _streamCtrl.abort(); return; }
+
+    let c = curChat();
+    if (!c) { newChat(); c = curChat(); }
+
+    const inp = document.getElementById('uIn');
+    const text = (inp.value || '').trim();
+    const hasText = !!text;
+    const hasAtts = _pendingAtts.length > 0;
+    if (!hasText && !hasAtts) { toast('请输入内容或上传附件', 'er'); return; }
+
+    const profile = curProfile();
+    if (!profile || !profile.key) {
+        toast('请先在 ⚙️ 中配置引擎 API Key', 'er');
+        openM('set');
+        return;
+    }
+
+    const userVisibleText = text || '(已上传 ' + _pendingAtts.length + ' 个附件)';
+    const attsForUser = _pendingAtts.slice();
+
+    let attachedText = '';
+    const imageAtts = [];
+    attsForUser.forEach(a => {
+        if (a.type === 'image') imageAtts.push(a);
+        else if (a.text) attachedText += '\n\n=== 📎 附件：' + a.fileName + ' ===\n' + a.text + '\n=== 附件结束 ===\n';
+    });
+
+    let kbText = '';
+    if (c.knowledgeBase && c.knowledgeBase.length) {
+        c.knowledgeBase.forEach(k => {
+            if (k.type === 'image') imageAtts.push({ fileName: k.name, dataUrl: k.dataUrl, type: 'image' });
+            else if (k.text) kbText += '\n\n=== 📚 知识库：' + k.name + ' ===\n' + k.text + '\n=== 知识库结束 ===\n';
+        });
+    }
+
+    const composedText = (kbText ? kbText + '\n' : '') + (attachedText ? attachedText + '\n' : '') + text;
+
+    const userMsg = {
+        id: gId(), role: 'user', content: userVisibleText,
+        attachments: attsForUser.map(a => ({ name: a.fileName, type: a.type, ext: a.meta && a.meta.ext })),
+        _time: nowTime(),
+    };
+    c.messages.push(userMsg);
+
+    const aiMsg = { id: gId(), role: 'assistant', content: '', _streaming: true, _time: nowTime(), _engId: S.currentEngId };
+    c.messages.push(aiMsg);
+
+    if (c.title === '新对话' && c.messages.length <= 2) {
+        c.title = (text || (attsForUser[0] && attsForUser[0].fileName) || '新对话').slice(0, 24);
+    }
+    c.updatedAt = Date.now();
+
+    inp.value = ''; aRsz(inp);
+    _pendingAtts = [];
+    renderAttList();
+
+    await saveNow();
+    renderMs();
+    renderSB();
+
+    const sendMsgs = [];
+    if (c.systemPrompt && c.systemPrompt.trim()) sendMsgs.push({ role: 'system', content: c.systemPrompt });
+    const lastUserIdx = c.messages.length - 2;
+    c.messages.forEach((m, idx) => {
+        if (m === aiMsg) return;
+        if (m._interrupted && !m.content) return;
+        if (idx === lastUserIdx && m.role === 'user') {
+            if (imageAtts.length) {
+                const parts = [];
+                if (composedText) parts.push({ type: 'text', text: composedText });
+                imageAtts.forEach(im => parts.push({ type: 'image_url', image_url: { url: im.dataUrl } }));
+                sendMsgs.push({ role: 'user', content: parts });
+            } else {
+                sendMsgs.push({ role: 'user', content: composedText || userVisibleText });
+            }
+        } else {
+            sendMsgs.push({ role: m.role, content: m.content });
+        }
+    });
+
+    const sendBtn = document.getElementById('sendBtn');
+    sendBtn.classList.add('stop');
+    sendBtn.textContent = '■';
+
+    const area = document.getElementById('msgsArea');
+    const lastMsgEl = area.querySelector('.msg:last-child .bub');
+    if (!lastMsgEl) { console.error('bub not found'); return; }
+
+    const updater = UI.makeStreamUpdater(lastMsgEl, area);
+    let lastSaveTime = Date.now();
+    const SAVE_INTERVAL = 3000;
+
+    _streamCtrl = API.streamChat(profile, sendMsgs, {
+        onStart: () => {},
+        onDelta: (delta, full) => {
+            aiMsg.content = full;
+            updater(full);
+            if (Date.now() - lastSaveTime > SAVE_INTERVAL) { lastSaveTime = Date.now(); scheduleSave(); }
+        },
+        onDone: async (full, usage) => {
+            aiMsg.content = full;
+            aiMsg._streaming = false;
+            if (usage) aiMsg._usage = usage;
+            c.updatedAt = Date.now();
+            _streamCtrl = null;
+            sendBtn.classList.remove('stop');
+            sendBtn.textContent = '➤';
+            UI.fullRender(lastMsgEl, full);
+            await saveNow();
+            renderMs();
+            renderSB();
+            if (typeof Archive !== 'undefined') Archive.notifyActivity();
+        },
+        onAbort: async (full, usage) => {
+            aiMsg.content = full;
+            aiMsg._streaming = false;
+            aiMsg._interrupted = true;
+            if (usage) aiMsg._usage = usage;
+            _streamCtrl = null;
+            sendBtn.classList.remove('stop');
+            sendBtn.textContent = '➤';
+            UI.fullRender(lastMsgEl, full || '_（已中断）_');
+            await saveNow();
+            renderMs();
+            toast('已停止');
+            if (typeof Archive !== 'undefined') Archive.notifyActivity();
+        },
+        onError: async (err) => {
+            console.error('[Send] 错误', err);
+            aiMsg.content = (aiMsg.content || '') + '\n\n❌ **错误**：' + err.message;
+            aiMsg._streaming = false;
+            aiMsg._interrupted = true;
+            _streamCtrl = null;
+            sendBtn.classList.remove('stop');
+            sendBtn.textContent = '➤';
+            UI.fullRender(lastMsgEl, aiMsg.content);
+            await saveNow();
+            toast('请求失败：' + err.message, 'er');
+        },
+    });
+}
+
+async function regenerate(msg) {
+    const c = curChat();
+    if (!c) return;
+    const idx = c.messages.indexOf(msg);
+    if (idx < 1) return;
+    const prev = c.messages[idx - 1];
+    if (prev.role !== 'user') { toast('无法找到对应的提问', 'er'); return; }
+    c.messages.splice(idx, 1);
+    const userText = typeof prev.content === 'string' ? prev.content : '';
+    c.messages.splice(idx - 1, 1);
+    document.getElementById('uIn').value = userText;
+    await saveNow();
+    renderMs();
+    send();
+}
+
+/* ===== 输入区 / 键盘 / 模态框 ===== */
+function aRsz(el) {
+    el.style.height = 'auto';
+    el.style.height = Math.min(el.scrollHeight, 130) + 'px';
+}
+function hKey(e) {
+    if (e.key === 'Enter' && !e.shiftKey && !e.isComposing) {
+        e.preventDefault();
+        send();
+    }
+}
+function openM(n) {
+    const m = document.getElementById('mo-' + n);
+    if (!m) return;
+    m.classList.add('show');
+    if (n === 'cs') { renderCSForm(); renderKBList(); }
+    if (n === 'set') { renderEngTabs(); renderEngForm(); renderStorageInfo(); renderGlobalSettings(); }
+    if (n === 'exp') updExpPreview();
+    if (n === 'snap' && IS_IOS) {
+        const w = document.getElementById('iosW');
+        if (w) w.style.display = 'block';
+    }
+}
+function closeM(n) {
+    const m = document.getElementById('mo-' + n);
+    if (m) m.classList.remove('show');
+}
+function togSB() {
+    document.getElementById('sb').classList.toggle('open');
+    document.getElementById('sbOv').classList.toggle('show');
+}
+
+/* ===== 附件 / 知识库 / 上传 ===== */
+function togAtt() { document.getElementById('attPan').classList.toggle('show'); }
+function updAttCont() { _attContinuous = document.getElementById('attCont').checked; }
+function onAtt(inputEl) { Upload.fromInput(inputEl); }
+
+async function _importShareFile(file) {
+    let password = '';
+    for (let attempt = 0; attempt < 3; attempt++) {
+        try {
+            const result = await Snapshot.importSharedChat(file, password);
+            const chat = result.chat;
+            S.chats[chat.id] = chat;
+            S.chatOrder.unshift(chat.id);
+            S.currentChatId = chat.id;
+            await saveNow();
+            renderAll();
+            const byText = result.sharedBy ? '（来自: ' + result.sharedBy + '）' : '';
+            toast('✅ 已导入分享对话' + byText + '，可继续聊天！');
+            return;
+        } catch (e) {
+            if (e.code === 'NEED_PASSWORD' || /口令/.test(e.message)) {
+                const pwd = prompt(
+                    attempt === 0 ? '该分享文件已加密，请输入访问口令：'
+                                  : '口令错误，请重新输入（剩余 ' + (3 - attempt) + ' 次）：',
+                    ''
+                );
+                if (pwd === null) { toast('已取消导入'); return; }
+                password = pwd.trim();
+                continue;
+            }
+            toast('❌ 导入分享失败：' + e.message, 'er');
+            return;
+        }
+    }
+    toast('❌ 口令错误次数过多，导入取消', 'er');
+}
+
+async function handleUploadedFiles(files) {
+    if (!files || !files.length) return;
+    const fileArr = Array.from(files);
+
+    const jsonFiles = fileArr.filter(f => /\.json$/i.test(f.name));
+    const otherFiles = fileArr.filter(f => !/\.json$/i.test(f.name));
+
+    for (const jf of jsonFiles) {
+        try {
+            const fileType = await Snapshot.detectFileType(jf);
+            if (fileType === 'share' || fileType === 'enc' || fileType === 'enc-pwd') {
+                await _importShareFile(jf);
+                continue;
+            }
+            if (fileType === 'snapshot') {
+                toast('📦 检测到快照文件，请通过侧边栏 → 📦 快照迁移 导入', 'er');
+                continue;
+            }
+            otherFiles.push(jf);
+        } catch (e) {
+            otherFiles.push(jf);
+        }
+    }
+
+    if (!otherFiles.length) return;
+
+    toast('开始解析 ' + otherFiles.length + ' 个文件...');
+    const results = await Parser.parseFiles(otherFiles);
+
+    let okCount = 0, failCount = 0;
+    results.forEach(r => {
+        if (r.ok) { _pendingAtts.push(r.result); okCount++; }
+        else { failCount++; toast('❌ ' + r.file.name + '：' + r.error, 'er'); }
+    });
+
+    if (_attContinuous && okCount > 0) {
+        const c = curChat();
+        if (c) {
+            if (!c.knowledgeBase) c.knowledgeBase = [];
+            results.forEach(r => {
+                if (r.ok) {
+                    c.knowledgeBase.push({
+                        id: gId(), name: r.result.fileName, type: r.result.type,
+                        text: r.result.text || '', dataUrl: r.result.dataUrl || null,
+                        meta: r.result.meta || {}, addedAt: Date.now(),
+                    });
+                }
+            });
+            c.updatedAt = Date.now();
+            await saveNow();
+            renderKBList();
+        }
+    }
+
+    if (okCount > 0) toast('✅ 已解析 ' + okCount + ' 个文件' + (failCount ? '（' + failCount + ' 失败）' : ''));
+    renderAttList();
+}
+
+function renderAttList() {
+    const box = document.getElementById('attListBox');
+    const list = document.getElementById('attList');
+    const cnt = document.getElementById('attCount');
+    const btn = document.getElementById('attBtn');
+    if (!_pendingAtts.length) {
+        box.style.display = 'none';
+        btn.classList.remove('has');
+        return;
+    }
+    box.style.display = 'block';
+    cnt.textContent = '📎 ' + _pendingAtts.length + ' 个附件待发送';
+    btn.classList.add('has');
+    list.innerHTML = '';
+    _pendingAtts.forEach((a, idx) => {
+        const item = document.createElement('div');
+        item.className = 'att-item';
+        const icon = a.type === 'image' ? '🖼️' : a.type === 'table' ? '📊' : a.type === 'document' ? '📄' : '📝';
+        const nm = document.createElement('span');
+        nm.className = 'ai-nm';
+        nm.textContent = icon + ' ' + a.fileName;
+        item.appendChild(nm);
+        const sz = document.createElement('span');
+        sz.className = 'ai-sz';
+        sz.textContent = a.type === 'image' ? (a.meta.sizeText || '') : (cntW(a.text) + ' 字');
+        item.appendChild(sz);
+        const rm = document.createElement('button');
+        rm.className = 'ai-rm';
+        rm.textContent = '×';
+        rm.title = '移除';
+        rm.onclick = () => { _pendingAtts.splice(idx, 1); renderAttList(); };
+        item.appendChild(rm);
+        list.appendChild(item);
+    });
+}
+
+function clrAtt() { _pendingAtts = []; renderAttList(); }
+
+async function addKB(inputEl) {
+    if (!inputEl.files || !inputEl.files.length) return;
+    const c = curChat();
+    if (!c) { toast('请先创建会话', 'er'); return; }
+    toast('解析知识库文件...');
+    const results = await Parser.parseFiles(inputEl.files);
+    if (!c.knowledgeBase) c.knowledgeBase = [];
+    let ok = 0;
+    results.forEach(r => {
+        if (r.ok) {
+            c.knowledgeBase.push({
+                id: gId(), name: r.result.fileName, type: r.result.type,
+                text: r.result.text || '', dataUrl: r.result.dataUrl || null,
+                meta: r.result.meta || {}, addedAt: Date.now(),
+            });
+            ok++;
+        } else {
+            toast('❌ ' + r.file.name + '：' + r.error, 'er');
+        }
+    });
+    if (ok > 0) {
+        c.updatedAt = Date.now();
+        await saveNow();
+        toast('✅ 已加入 ' + ok + ' 个知识库文件');
+    }
+    renderKBList();
+    inputEl.value = '';
+}
+
+function renderKBList() {
+    const wrap = document.getElementById('kbList');
+    if (!wrap) return;
+    const c = curChat();
+    if (!c || !c.knowledgeBase || !c.knowledgeBase.length) {
+        wrap.innerHTML = '<div style="font-size:11px;color:var(--text2)">（暂无知识库文件）</div>';
+        return;
+    }
+    wrap.innerHTML = '';
+    c.knowledgeBase.forEach((k, idx) => {
+        const item = document.createElement('div');
+        item.className = 'att-item';
+        item.style.marginBottom = '4px';
+        const icon = k.type === 'image' ? '🖼️' : k.type === 'table' ? '📊' : k.type === 'document' ? '📄' : '📝';
+        const nm = document.createElement('span');
+        nm.className = 'ai-nm';
+        nm.textContent = icon + ' ' + k.name;
+        item.appendChild(nm);
+        const sz = document.createElement('span');
+        sz.className = 'ai-sz';
+        sz.textContent = k.type === 'image' ? '图片' : (cntW(k.text || '') + ' 字');
+        item.appendChild(sz);
+        const rm = document.createElement('button');
+        rm.className = 'ai-rm';
+        rm.textContent = '×';
+        rm.title = '移除';
+        rm.onclick = async () => {
+            if (!confirm('从知识库移除 "' + k.name + '"？')) return;
+            c.knowledgeBase.splice(idx, 1);
+            c.updatedAt = Date.now();
+            await saveNow();
+            renderKBList();
+        };
+        item.appendChild(rm);
+        wrap.appendChild(item);
+    });
+}
+
+/* ===== 快照 / 导入导出 ===== */
+function eSnap() {
+    const includeKey = confirm(
+        '导出快照\n\n✅ 确定 = 包含 API Key（推荐：仅本地备份用）\n' +
+        '❌ 取消 = 不含 API Key（推荐：分享/上传云盘用）\n\n' +
+        '提示：不含 Key 的快照导入后需要重新填写 Key。'
+    );
+    Snapshot.exportToFile(S, { includeKey: includeKey });
+}
+
+async function iSnap(inputEl) {
+    if (!inputEl.files || !inputEl.files.length) return;
+    const file = inputEl.files[0];
+    const mode = confirm(
+        '导入模式选择：\n\n✅ 确定 = 替换模式（清除现有数据，完全使用快照）\n' +
+        '❌ 取消 = 合并模式（保留现有 + 添加快照内容）\n\n' +
+        '✨ 两种模式都会智能保护你本地已有的 API Key'
+    );
+    try {
+        await DB.setSetting('pre_import_backup', {
+            state: JSON.parse(JSON.stringify(S)),
+            time: Date.now(),
+            reason: mode ? 'replace' : 'merge',
+        });
+        console.log('[Snapshot] 已自动备份当前数据（可通过"恢复"按钮回滚）');
+
+        const { state: importedState, source } = await Snapshot.importFromFile(file);
+        let finalState;
+        if (mode) {
+            const { state: protectedState, protectedCount } = Snapshot.protectLocalKeys(importedState, S);
+            finalState = protectedState;
+            if (protectedCount > 0) toast('🔑 已保护 ' + protectedCount + ' 个本地 API Key');
+        } else {
+            const { state: protectedState, protectedCount } = Snapshot.protectLocalKeys(importedState, S);
+            finalState = Snapshot.mergeStates(S, protectedState);
+            if (protectedCount > 0) toast('🔑 已保护 ' + protectedCount + ' 个本地 API Key');
+        }
+        S = finalState;
+        if (!S.profiles[S.currentEngId]) S.currentEngId = Object.keys(S.profiles)[0] || 'zenmux';
+        loadState_postFix();
+        await saveNow();
+        await Snapshot.snapNow(S);
+        renderAll();
+        const chatCount = Object.keys(S.chats || {}).length;
+        toast('✅ 导入成功（' + source + '）：共 ' + chatCount + ' 个会话');
+        closeM('snap');
+    } catch (e) {
+        console.error('[Import]', e);
+        toast('导入失败：' + e.message, 'er');
+    }
+    inputEl.value = '';
+}
+
+function loadState_postFix() {
+    for (const id in S.profiles) {
+        const p = S.profiles[id];
+        if (p.protocol === undefined) p.protocol = 'openai';
+        if (p.authType === undefined) p.authType = 'bearer';
+        if (p.useCache === undefined) p.useCache = false;
+        if (p.cacheTTL === undefined) p.cacheTTL = '5m';
+        if (p.priceIn === undefined) p.priceIn = 0;
+        if (p.priceOut === undefined) p.priceOut = 0;
+        if (p.priceCacheRead === undefined) p.priceCacheRead = 0;
+        if (p.priceCacheWrite === undefined) p.priceCacheWrite = 0;
+    }
+}
+
+async function restorePreImport() {
+    try {
+        const backup = await DB.getSetting('pre_import_backup', null);
+        if (!backup || !backup.state) {
+            toast('没有可恢复的备份', 'er');
+            return;
+        }
+        const timeStr = new Date(backup.time).toLocaleString();
+        if (!confirm(
+            '⚠️ 确认恢复到上次导入前的状态？\n\n' +
+            '备份时间：' + timeStr + '\n' +
+            '当时操作：' + (backup.reason === 'replace' ? '替换导入' : '合并导入') + '\n\n' +
+            '恢复后当前数据将被覆盖！'
+        )) return;
+
+        S = backup.state;
+        if (!S.profiles[S.currentEngId]) S.currentEngId = Object.keys(S.profiles)[0] || 'zenmux';
+        loadState_postFix();
+        await saveNow();
+        await Snapshot.snapNow(S);
+        renderAll();
+        toast('✅ 已恢复到导入前的状态（' + timeStr + '）');
+        closeM('snap');
+    } catch (e) {
+        console.error('[Restore]', e);
+        toast('恢复失败：' + e.message, 'er');
+    }
+}
+
+/* ===== 对话导出 ===== */
+function updExp() {
+    _exportMode = document.getElementById('expFmt').value;
+    updExpPreview();
+}
+
+function buildExportContent(chatArg, modeArg) {
+    const c = chatArg || curChat();
+    const mode = modeArg || _exportMode;
+    if (!c || !c.messages || !c.messages.length) {
+        return { plain: '（无内容）', html: '<p>（无内容）</p>', title: '空对话', md: '（无内容）' };
+    }
+    const title = c.title || '对话记录';
+    const isPure = mode === 'pure';
+    let plain = '', html = '', mdOut = '';
+    if (!isPure) {
+        plain = '【' + title + '】\n导出时间：' + new Date().toLocaleString() + '\n\n';
+        mdOut = '# ' + title + '\n\n> 导出时间：' + new Date().toLocaleString() + '\n\n';
+        html = '<h1>' + esc(title) + '</h1><p style="color:#888;font-size:12px">导出时间：'
+             + esc(new Date().toLocaleString()) + '</p><hr>';
+    }
+    c.messages.forEach((m) => {
+        const text = typeof m.content === 'string' ? m.content : JSON.stringify(m.content);
+        if (isPure) {
+            if (m.role === 'assistant' && text) {
+                plain += text + '\n\n';
+                mdOut += text + '\n\n---\n\n';
+                html += UI.renderMarkdown(text) + '<hr style="border:none;border-top:1px dashed #ccc;margin:24px 0">';
+            }
+        } else {
+            const roleName = m.role === 'user' ? '👤 我' : (m.role === 'assistant' ? '🤖 AI' : '⚙️ 系统');
+            plain += '【' + roleName + '】' + (m._time ? ' ' + m._time : '') + '\n' + text + '\n\n';
+            mdOut += '## ' + roleName + (m._time ? ' (' + m._time + ')' : '') + '\n\n' + text + '\n\n';
+            html += '<div style="margin:18px 0;padding:12px 16px;background:'
+                  + (m.role === 'user' ? '#e3f2fd' : '#f5f5f5')
+                  + ';border-radius:8px"><strong>' + esc(roleName) + '</strong>'
+                  + (m._time ? ' <span style="color:#888;font-size:12px">' + esc(m._time) + '</span>' : '')
+                  + '<div style="margin-top:6px">'
+                  + (m.role === 'assistant' ? UI.renderMarkdown(text)
+                     : '<pre style="white-space:pre-wrap;font-family:inherit;margin:0">' + esc(text) + '</pre>')
+                  + '</div></div>';
+        }
+    });
+    return { plain: plain.trim(), html: html, title: title, md: mdOut.trim() };
+}
+
+function buildArchiveHtml(chat) {
+    const { html, title } = buildExportContent(chat, 'full');
+    return '<!DOCTYPE html><html><head><meta charset="UTF-8"><title>'
+        + esc(title) + '</title>'
+        + '<link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/highlight.js/11.9.0/styles/github.min.css">'
+        + '<style>body{font-family:-apple-system,BlinkMacSystemFont,Segoe UI,Roboto,sans-serif;'
+        + 'max-width:860px;margin:32px auto;padding:0 16px;line-height:1.7;color:#222}'
+        + 'pre{background:#f6f8fa;border-radius:8px;padding:12px;overflow-x:auto;font-size:13px}'
+        + 'code{font-family:SF Mono,Consolas,monospace}'
+        + 'table{border-collapse:collapse;margin:12px 0}'
+        + 'th,td{border:1px solid #ddd;padding:6px 12px}th{background:#f0f0f0}'
+        + 'blockquote{border-left:4px solid #667eea;padding-left:12px;color:#666;margin:8px 0}'
+        + 'img{max-width:100%}</style></head><body>' + html + '</body></html>';
+}
+
+function updExpPreview() {
+    const ta = document.getElementById('expTA');
+    if (!ta) return;
+    const { plain } = buildExportContent();
+    ta.value = plain;
+}
+function eTxt() {
+    const { plain, title } = buildExportContent();
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    dl(plain, (title || 'chat') + '-' + ts + '.txt', 'text/plain');
+    toast('✅ TXT 已导出');
+}
+function eMd() {
+    const { md, title } = buildExportContent();
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    dl(md, (title || 'chat') + '-' + ts + '.md', 'text/markdown');
+    toast('✅ Markdown 已导出');
+}
+function eHtml() {
+    const c = curChat();
+    const full = buildArchiveHtml(c);
+    const { title } = buildExportContent();
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    dl(full, (title || 'chat') + '-' + ts + '.html', 'text/html');
+    toast('✅ HTML 已导出');
+}
+function eDoc() {
+    const { html, title } = buildExportContent();
+    const full = '<html xmlns:o="urn:schemas-microsoft-com:office:office" '
+        + 'xmlns:w="urn:schemas-microsoft-com:office:word" '
+        + 'xmlns="http://www.w3.org/TR/REC-html40">'
+        + '<head><meta charset="UTF-8"><title>' + esc(title) + '</title>'
+        + '<style>body{font-family:微软雅黑,Microsoft YaHei,Arial;line-height:1.7;font-size:14px}'
+        + 'pre{background:#f6f8fa;padding:8px;border:1px solid #ddd;font-family:Consolas,monospace}'
+        + 'table{border-collapse:collapse}th,td{border:1px solid #999;padding:4px 8px}'
+        + '</style></head><body>' + html + '</body></html>';
+    const ts = new Date().toISOString().replace(/[:.]/g, '-').slice(0, 19);
+    dl(full, (title || 'chat') + '-' + ts + '.doc', 'application/msword');
+    toast('✅ Word 已导出');
+}
+function cpExp() {
+    const ta = document.getElementById('expTA');
+    if (!ta || !ta.value) { toast('无内容', 'er'); return; }
+    ta.select();
+    try {
+        document.execCommand('copy');
+        toast('✅ 已复制到剪贴板');
+    } catch (e) {
+        navigator.clipboard.writeText(ta.value).then(() => toast('✅ 已复制'));
+    }
+}
+
+/* ===== 初始化 ===== */
+async function initApp() {
+    try {
+        await DB.init();
+        await DB.migrateFromLocalStorage();
+        await DB.requestPersistent();
+        await loadState();
+
+        if (!S.currentChatId || !S.chats[S.currentChatId]) {
+            if (S.chatOrder.length && S.chats[S.chatOrder[0]]) {
+                S.currentChatId = S.chatOrder[0];
+            } else {
+                newChat();
+            }
+        }
+        renderAll();
+        initUpload();
+        initSnapshot();
+        await initArchive();
+        checkURLImport();
+        maybePromptAuth();
+        toast('✅ 飞凡AI 就绪');
+    } catch (e) {
+        console.error('[InitApp]', e);
+        toast('初始化失败：' + e.message, 'er');
+    }
+}
+
+function initUpload() {
+    if (typeof Upload === 'undefined') return;
+    Upload.onFiles(handleUploadedFiles);
+    Upload.init({
+        dropTarget: document.getElementById('msgsArea'),
+        dropMask: document.getElementById('dropMask'),
+        paste: true,
+    });
+    console.log('[Upload] 已就绪');
+}
+
+function initSnapshot() {
+    if (typeof Snapshot === 'undefined') return;
+    Snapshot.startAuto(S.snapInterval || 5, () => S);
+    console.log('[Snapshot] 已挂载');
+}
+
+async function initArchive() {
+    if (typeof Archive === 'undefined') return;
+    await Archive.init({
+        getState: () => S,
+        buildHtml: (chat) => buildArchiveHtml(chat),
+        intervalMin: S.archiveInterval !== undefined ? S.archiveInterval : 10,
+        debounceMin: 1,
+    });
+    console.log('[Archive] 已挂载');
+}
+
+/* ===== 存档授权提示 ===== */
+function maybePromptAuth() {
+    if (typeof Archive === 'undefined') return;
+    if (Archive.needsAuth()) showAuthModal();
+}
+function showAuthModal() {
+    const m = document.getElementById('mo-auth');
+    if (!m) return;
+    const nameEl = document.getElementById('authDirName');
+    if (nameEl) nameEl.textContent = Archive.getDirName() || '已设定目录';
+    m.classList.add('show');
+}
+function closeAuthModal() {
+    const m = document.getElementById('mo-auth');
+    if (m) m.classList.remove('show');
+}
+async function doAuthNow() {
+    if (typeof Archive === 'undefined') return;
+    const ok = await Archive.requestAuthNow();
+    if (ok) {
+        closeAuthModal();
+        toast('✅ 存档已授权，本次将自动保存');
+        renderArchiveInfo();
+        Archive.archiveAll({ silent: true });
+    } else {
+        toast('授权未通过，可稍后在 ⚙️ 中重试', 'er');
+    }
+}
+
+/* ===== URL 参数导入分享对话 ===== */
+async function checkURLImport() {
+    const params = new URLSearchParams(window.location.search);
+    const shareUrl = params.get('share');
+    if (!shareUrl) return;
+    try {
+        toast('正在加载分享对话...');
+        const resp = await fetch(shareUrl);
+        if (!resp.ok) throw new Error('HTTP ' + resp.status);
+        const raw = await resp.json();
+        let password = '';
+        if (raw && raw.__feifan_enc__ && raw.hasPassword) {
+            const pwd = prompt('该分享已加密，请输入访问口令：', '');
+            password = pwd ? pwd.trim() : '';
+        }
+        const result = await Snapshot.normalizeSharedObject(raw, password);
+        const chat = result.chat;
+        S.chats[chat.id] = chat;
+        S.chatOrder.unshift(chat.id);
+        S.currentChatId = chat.id;
+        await saveNow();
+        renderAll();
+        const byText = result.sharedBy ? '（来自: ' + result.sharedBy + '）' : '';
+        toast('✅ 已导入分享对话' + byText + '，可继续聊天！');
+        window.history.replaceState({}, '', window.location.pathname);
+    } catch (e) {
+        console.error('[URLImport]', e);
+        toast('分享链接加载失败：' + e.message, 'er');
+    }
+}
+
+if (document.readyState === 'loading') {
+    document.addEventListener('DOMContentLoaded', initApp);
+} else {
+    initApp();
+}
+
+window.addEventListener('beforeunload', () => {
+    if (_streamCtrl) {
+        try { DB.saveState(S); } catch (e) {}
+    }
+});
+
+document.addEventListener('visibilitychange', () => {
+    if (!document.hidden) {
+        const setM = document.getElementById('mo-set');
+        if (setM && setM.classList.contains('show')) renderStorageInfo();
+    }
+});
+
+/* ===== Service Worker（PWA） ===== */
+if ('serviceWorker' in navigator) {
+    window.addEventListener('load', () => {
+        navigator.serviceWorker.register('/sw.js').then(reg => {
+            console.log('[PWA] SW registered:', reg.scope);
+        }).catch(err => {
+            console.warn('[PWA] SW failed:', err);
+        });
+    });
+}
